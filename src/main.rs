@@ -20,19 +20,24 @@ use anyhow::{anyhow, bail, Result};
 use libc::{c_char, c_int, c_uint, c_void, size_t};
 use once_cell::sync::OnceCell;
 
-static REGISTRY: OnceCell<Registry> = OnceCell::new();
+//static REGISTRY: OnceCell<Registry> = OnceCell::new();
 static ORIGINAL_CREATE_PROC: OnceCell<sys::CreateProcFn> = OnceCell::new();
 
-#[derive(Default)]
-struct Registry {
-    cookies: Mutex<Vec<Arc<DoorInner>>>,
+//#[derive(Default)]
+//struct Registry {
+//    cookies: Mutex<Vec<Arc<DoorInner>>>,
+//}
+
+thread_local! {
+    static DOOR_SERVER_THREAD: RefCell<*const ServerThread> = const {
+        RefCell::new(std::ptr::null())
+    };
 }
 
 #[derive(Debug)]
-enum ServerThreadState {
-    Created,
-    Bound,
-    Exited,
+struct ServerThread {
+    locked: Mutex<ServerThreadLocked>,
+    cv: Condvar,
 }
 
 #[derive(Debug)]
@@ -44,100 +49,101 @@ struct ServerThreadLocked {
 }
 
 #[derive(Debug)]
-struct ServerThread {
-    locked: Mutex<ServerThreadLocked>,
-    cv: Condvar,
+enum ServerThreadState {
+    Created,
+    Bound,
+    Exited,
 }
 
-impl Registry {
-    /**
-     * Obtain a reference to the global registry for all door servers created by
-     * this library.
-     */
-    fn obtain() -> &'static Registry {
-        /*
-         * Install our door thread creation procedure, stashing the original one
-         * so that we can chain calls to it for doors that do not belong to us.
-         */
-        ORIGINAL_CREATE_PROC.get_or_init(|| unsafe {
-            sys::door_server_create(rust_door_create_proc)
-        });
-
-        REGISTRY.get_or_init(|| Registry::default())
-    }
-
-    fn unregister(&self, di: &Arc<DoorInner>) {
-        let mut cookies = self.cookies.lock().unwrap();
-
-        let mut found = false;
-        while let Some(i) =
-            cookies.iter().position(|c| Arc::as_ptr(c) == Arc::as_ptr(di))
-        {
-            /*
-             * Make sure there are no active server threads and that there will
-             * be no new threads in future.
-             */
-            {
-                let locked = cookies[i].locked.lock().unwrap();
-                if !locked.threads.is_empty() {
-                    panic!("unregister door that still has threads");
-                }
-            }
-
-            cookies.swap_remove(i);
-            found = true;
-        }
-
-        if !found {
-            eprintln!("WARNING: unregister found nothing");
-        }
-    }
-
-    fn register(&self, di: &Arc<DoorInner>) -> *mut c_void {
-        let mut cookies = self.cookies.lock().unwrap();
-
-        /*
-         * Make sure this door object is not already registered.
-         */
-        for c in cookies.iter() {
-            if Arc::as_ptr(c) == Arc::as_ptr(di) {
-                panic!("double registration?");
-            }
-        }
-
-        /*
-         * Take a hold on the inner door object that we use for the cookie
-         * pointer.  This will prevent it from being freed until we revoke it.
-         */
-        cookies.push(Arc::clone(&di));
-
-        /*
-         * Return the inner door object address to use as the cookie.  This
-         * pointer will be valid until the object is removed by a subsequent
-         * unregister() call, which will remove our reference to it.  Server
-         * threads and other consumers must take their own references.
-         */
-        Arc::as_ptr(di) as *mut c_void
-    }
-
-    fn locate(&self, cookie: *mut c_void) -> Option<Arc<DoorInner>> {
-        if cookie.is_null() {
-            return None;
-        }
-
-        let cookies = self.cookies.lock().unwrap();
-
-        for c in cookies.iter() {
-            if Arc::as_ptr(c) == (cookie as *const DoorInner) {
-                let di = Arc::clone(&c);
-                assert_eq!(Arc::as_ptr(&di) as *mut c_void, cookie);
-                return Some(Arc::clone(&c));
-            }
-        }
-
-        None
-    }
-}
+// impl Registry {
+//     /**
+//      * Obtain a reference to the global registry for all door servers created by
+//      * this library.
+//      */
+//     fn obtain() -> &'static Registry {
+//         /*
+//          * Install our door thread creation procedure, stashing the original one
+//          * so that we can chain calls to it for doors that do not belong to us.
+//          */
+//         ORIGINAL_CREATE_PROC.get_or_init(|| unsafe {
+//             sys::door_server_create(rust_door_create_proc)
+//         });
+//
+//         REGISTRY.get_or_init(|| Registry::default())
+//     }
+//
+//     fn unregister(&self, di: &Arc<DoorInner>) {
+//         let mut cookies = self.cookies.lock().unwrap();
+//
+//         let mut found = false;
+//         while let Some(i) =
+//             cookies.iter().position(|c| Arc::as_ptr(c) == Arc::as_ptr(di))
+//         {
+//             /*
+//              * Make sure there are no active server threads and that there will
+//              * be no new threads in future.
+//              */
+//             {
+//                 let locked = cookies[i].locked.lock().unwrap();
+//                 if !locked.threads.is_empty() {
+//                     panic!("unregister door that still has threads");
+//                 }
+//             }
+//
+//             cookies.swap_remove(i);
+//             found = true;
+//         }
+//
+//         if !found {
+//             eprintln!("WARNING: unregister found nothing");
+//         }
+//     }
+//
+//     fn register(&self, di: &Arc<DoorInner>) -> *mut c_void {
+//         let mut cookies = self.cookies.lock().unwrap();
+//
+//         /*
+//          * Make sure this door object is not already registered.
+//          */
+//         for c in cookies.iter() {
+//             if Arc::as_ptr(c) == Arc::as_ptr(di) {
+//                 panic!("double registration?");
+//             }
+//         }
+//
+//         /*
+//          * Take a hold on the inner door object that we use for the cookie
+//          * pointer.  This will prevent it from being freed until we revoke it.
+//          */
+//         cookies.push(Arc::clone(&di));
+//
+//         /*
+//          * Return the inner door object address to use as the cookie.  This
+//          * pointer will be valid until the object is removed by a subsequent
+//          * unregister() call, which will remove our reference to it.  Server
+//          * threads and other consumers must take their own references.
+//          */
+//         Arc::as_ptr(di) as *mut c_void
+//     }
+//
+//     fn locate(&self, cookie: *mut c_void) -> Option<Arc<DoorInner>> {
+//         if cookie.is_null() {
+//             return None;
+//         }
+//
+//         let cookies = self.cookies.lock().unwrap();
+//
+//         for c in cookies.iter() {
+//             if Arc::as_ptr(c) == (cookie as *const DoorInner) {
+//                 let di = Arc::clone(&c);
+//                 assert_eq!(Arc::as_ptr(&di) as *mut c_void, cookie);
+//                 return Some(Arc::clone(&c));
+//             }
+//         }
+//
+//         None
+//     }
+// }
 
 #[allow(unused)]
 mod sys;
@@ -242,22 +248,24 @@ extern "C" fn rust_door_create_proc(infop: *mut sys::DoorInfo) {
     /*
      * From this point forward, we are confident that we own the door and there
      * should be no chaining to other thread creation functions.
+     *
+     * It should be safe to use the reference to our inner door object here in
+     * the thread creation callback.  This callback is only called with our
+     * cookie value during a door_call(3C) or a door_return(3C).  In the
+     * DOOR_PRIVATE model we have control of when both of those calls occur:
+     * either initially during our constructor, or within one of our managed
+     * threads created below.
      */
-
-    /*
-     * Look up the cookie in the registry.
-     */
-    let reg = Registry::obtain();
-    let Some(di) = reg.locate(info.di_data) else {
-        println!("rust_door_create_proc({info:#?}): could not locate?");
-        return;
+    let (weak_di, di) = {
+        let di = unsafe { Arc::from_raw(info.di_data as *const DoorInner) };
+        (Arc::downgrade(&di), unsafe { &*Arc::into_raw(di) })
     };
 
     let st = Arc::new(ServerThread {
         locked: Mutex::new(ServerThreadLocked {
             thread_id: None,
             state: ServerThreadState::Created,
-            door: Some(Arc::downgrade(&di)),
+            door: Some(weak_di),
             shutdown: false,
         }),
         cv: Default::default(),
@@ -265,7 +273,8 @@ extern "C" fn rust_door_create_proc(infop: *mut sys::DoorInfo) {
 
     /*
      * Make sure we are still supposed to be creating threads, and if so,
-     * register this one.
+     * register this one.  Registration needs to occur prior to creating the
+     * thread so that we don't end up racing with a revocation.
      */
     {
         let mut locked = di.locked.lock().unwrap();
@@ -380,16 +389,6 @@ extern "C" fn rust_door_thread_exit() -> *mut c_void {
     std::ptr::null_mut()
 }
 
-thread_local! {
-    static DOOR_SERVER_THREAD: RefCell<*const ServerThread> = const {
-        RefCell::new(std::ptr::null())
-    };
-
-//    static DOOR_INFO: RefCell<*const DoorInner> = const {
-//        RefCell::new(std::ptr::null())
-//    };
-}
-
 #[no_mangle]
 extern "C" fn rust_door_thread(arg: *mut c_void) -> *mut c_void {
     let tid = unsafe { sys::thr_self() };
@@ -412,6 +411,7 @@ extern "C" fn rust_door_thread(arg: *mut c_void) -> *mut c_void {
      * reconstituted from the thread local and dropped.
      */
     assert!(DOOR_SERVER_THREAD.replace(st).is_null());
+    let st = unsafe { &*st };
 
     /*
      * Wait for the file descriptor to be stored in the object after door
@@ -420,8 +420,6 @@ extern "C" fn rust_door_thread(arg: *mut c_void) -> *mut c_void {
      * to race.
      */
     let fd = {
-        let st = unsafe { &*st };
-
         /*
          * The per-thread object contains a weak reference to the per-door
          * object.  Upgrade that reference so we can interact with it here:
@@ -499,6 +497,13 @@ extern "C" fn rust_door_thread(arg: *mut c_void) -> *mut c_void {
      */
     if unsafe { sys::door_bind(fd) } == -1 {
         return rust_door_thread_exit();
+    }
+
+    {
+        let mut locked = st.locked.lock().unwrap();
+        assert!(matches!(locked.state, ServerThreadState::Created));
+        locked.state = ServerThreadState::Bound;
+        st.cv.notify_all();
     }
 
     /*
@@ -642,7 +647,14 @@ impl Door {
     where
         F: Fn(Arg) + Send + Sync + RefUnwindSafe + 'static,
     {
-        let reg = Registry::obtain();
+        /*
+         * Install our door thread creation procedure, stashing the original
+         * one so that we can chain calls to it for doors that do not belong to
+         * us.
+         */
+        ORIGINAL_CREATE_PROC.get_or_init(|| unsafe {
+            sys::door_server_create(rust_door_create_proc)
+        });
 
         /*
          * First, create our tracking object.  We need to do this prior to door
@@ -665,10 +677,12 @@ impl Door {
         println!("REF 1: {}", Arc::strong_count(&d.inner));
 
         /*
-         * Place a reference to the inner door object in the global registry,
-         * returning a cookie pointer we can use for door creation.
+         * We need to turn the inner object into a raw pointer that we can use
+         * as a cookie value to pass to door_create(3C).  In the drop
+         * implementation for Door, we'll abort the process if we cannot claw
+         * the pointer back from the system before we drop our reference.
          */
-        let cookie = reg.register(&d.inner);
+        let cookie = Arc::as_ptr(&d.inner) as *mut c_void;
 
         println!("REF 2: {}", Arc::strong_count(&d.inner));
 
@@ -934,16 +948,31 @@ impl Door {
 
 impl Drop for Door {
     fn drop(&mut self) {
+        /*
+         * NOTE: This revoke call is vital for correctness.  If we allow the
+         * Door to be dropped without completely tearing everything down, it's
+         * possible that our inner object will then be freed, invalidating the
+         * pointer that we have used as a cookie for door_create(3C).
+         */
         if let Err(e) = self.revoke() {
+            /*
+             * XXX upanic() here
+             */
             panic!("door server still active on drop, revocation failed: {e}");
         }
+
+        println!(
+            "    DOOR DROP = refcount s {} w {}",
+            Arc::strong_count(&self.inner),
+            Arc::weak_count(&self.inner),
+        );
 
         /*
          * Make sure we don't leak our inner object by leaving a reference in
          * the global registry:
          */
-        let reg = Registry::obtain();
-        reg.unregister(&self.inner);
+        //let reg = Registry::obtain();
+        //reg.unregister(&self.inner);
     }
 }
 
@@ -1103,11 +1132,16 @@ fn main() -> Result<()> {
 
     Ok(())
 
-//    println!("dropping...");
-//    drop(d);
-//
-//    println!("waiting...");
-//    loop {
-//        std::thread::sleep(Duration::from_secs(1));
-//    }
+    // println!("dropping...");
+    // println!(
+    //     "    = refcount s {} w {}",
+    //     Arc::strong_count(&d.inner),
+    //     Arc::weak_count(&d.inner),
+    // );
+    // drop(d);
+
+    // println!("waiting...");
+    // loop {
+    //     std::thread::sleep(Duration::from_secs(1));
+    // }
 }
