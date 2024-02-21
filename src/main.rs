@@ -6,7 +6,7 @@ use std::{
     fs::File,
     io::ErrorKind,
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
         unix::prelude::OsStrExt,
     },
     panic::RefUnwindSafe,
@@ -20,13 +20,7 @@ use anyhow::{anyhow, bail, Result};
 use libc::{c_char, c_int, c_uint, c_void, size_t};
 use once_cell::sync::OnceCell;
 
-//static REGISTRY: OnceCell<Registry> = OnceCell::new();
 static ORIGINAL_CREATE_PROC: OnceCell<sys::CreateProcFn> = OnceCell::new();
-
-//#[derive(Default)]
-//struct Registry {
-//    cookies: Mutex<Vec<Arc<DoorInner>>>,
-//}
 
 thread_local! {
     static DOOR_SERVER_THREAD: RefCell<*const ServerThread> = const {
@@ -54,96 +48,6 @@ enum ServerThreadState {
     Bound,
     Exited,
 }
-
-// impl Registry {
-//     /**
-//      * Obtain a reference to the global registry for all door servers created by
-//      * this library.
-//      */
-//     fn obtain() -> &'static Registry {
-//         /*
-//          * Install our door thread creation procedure, stashing the original one
-//          * so that we can chain calls to it for doors that do not belong to us.
-//          */
-//         ORIGINAL_CREATE_PROC.get_or_init(|| unsafe {
-//             sys::door_server_create(rust_door_create_proc)
-//         });
-//
-//         REGISTRY.get_or_init(|| Registry::default())
-//     }
-//
-//     fn unregister(&self, di: &Arc<DoorInner>) {
-//         let mut cookies = self.cookies.lock().unwrap();
-//
-//         let mut found = false;
-//         while let Some(i) =
-//             cookies.iter().position(|c| Arc::as_ptr(c) == Arc::as_ptr(di))
-//         {
-//             /*
-//              * Make sure there are no active server threads and that there will
-//              * be no new threads in future.
-//              */
-//             {
-//                 let locked = cookies[i].locked.lock().unwrap();
-//                 if !locked.threads.is_empty() {
-//                     panic!("unregister door that still has threads");
-//                 }
-//             }
-//
-//             cookies.swap_remove(i);
-//             found = true;
-//         }
-//
-//         if !found {
-//             eprintln!("WARNING: unregister found nothing");
-//         }
-//     }
-//
-//     fn register(&self, di: &Arc<DoorInner>) -> *mut c_void {
-//         let mut cookies = self.cookies.lock().unwrap();
-//
-//         /*
-//          * Make sure this door object is not already registered.
-//          */
-//         for c in cookies.iter() {
-//             if Arc::as_ptr(c) == Arc::as_ptr(di) {
-//                 panic!("double registration?");
-//             }
-//         }
-//
-//         /*
-//          * Take a hold on the inner door object that we use for the cookie
-//          * pointer.  This will prevent it from being freed until we revoke it.
-//          */
-//         cookies.push(Arc::clone(&di));
-//
-//         /*
-//          * Return the inner door object address to use as the cookie.  This
-//          * pointer will be valid until the object is removed by a subsequent
-//          * unregister() call, which will remove our reference to it.  Server
-//          * threads and other consumers must take their own references.
-//          */
-//         Arc::as_ptr(di) as *mut c_void
-//     }
-//
-//     fn locate(&self, cookie: *mut c_void) -> Option<Arc<DoorInner>> {
-//         if cookie.is_null() {
-//             return None;
-//         }
-//
-//         let cookies = self.cookies.lock().unwrap();
-//
-//         for c in cookies.iter() {
-//             if Arc::as_ptr(c) == (cookie as *const DoorInner) {
-//                 let di = Arc::clone(&c);
-//                 assert_eq!(Arc::as_ptr(&di) as *mut c_void, cookie);
-//                 return Some(Arc::clone(&c));
-//             }
-//         }
-//
-//         None
-//     }
-// }
 
 #[allow(unused)]
 mod sys;
@@ -717,8 +621,9 @@ impl Door {
         Ok(d)
     }
 
-    fn door_fd(&self) -> c_int {
-        self.inner.locked.lock().unwrap().fd.unwrap()
+    fn door_fd(&self) -> BorrowedFd {
+        let fd = self.inner.locked.lock().unwrap().fd.unwrap();
+        unsafe { BorrowedFd::borrow_raw(fd) }
     }
 
     fn attach_impl(&self, path: &Path, force: bool) -> Result<()> {
@@ -751,7 +656,8 @@ impl Door {
             .open(&path)
             .map_err(|e| anyhow!("creating {path:?}: {e}"))?;
 
-        let r = unsafe { sys::fattach(self.door_fd(), cpath.as_ptr()) };
+        let r =
+            unsafe { sys::fattach(self.door_fd().as_raw_fd(), cpath.as_ptr()) };
         if r != 0 {
             let e = std::io::Error::last_os_error();
             bail!("unable to attach at {path:?}: {e}");
@@ -858,14 +764,16 @@ impl Door {
          * from keeping a door descriptor open for a long time even though we
          * may have detached it from the file system.  A call to door_call(3C)
          * will block waiting for a thread, and if no such thread happens to
-         * exist we will block forever -- or until the door is revoked.
+         * exist because another process got to it first, we will block forever
+         * -- or until the door is revoked.
          *
          * To avoid blocking this thread, we start _another_ thread whose sole
-         * job is to make frenetic door calls until we have, here, determined
-         * that there are no threads left to wake up.  At that time, we'll
-         * revoke the door and then join our helper thread.  Note that we
-         * cannot simply use the original file descriptor here, because
-         * door_revoke(3C) will, as a side effect, close(2) the fd.
+         * job is to make frenetic meaningless door calls until we have, here,
+         * determined that there are no threads left to wake up.  At that time,
+         * we'll revoke the door and then join our helper thread.  Note that to
+         * avoid a race with our helper thread we must duplicate our original
+         * file descriptor here; door_revoke(3C) will, as a side effect,
+         * close(2) our original fd.
          */
 
         let other_fd = unsafe {
@@ -921,10 +829,12 @@ impl Door {
                 })
                 .count();
 
-            println!("REVOKE: {nactive} still active");
             if nactive == 0 {
                 break;
             }
+
+            println!("REVOKE: {nactive} still active");
+            std::thread::yield_now();
         }
 
         let r = unsafe { sys::door_revoke(fd) };
@@ -966,19 +876,28 @@ impl Drop for Door {
             Arc::strong_count(&self.inner),
             Arc::weak_count(&self.inner),
         );
-
-        /*
-         * Make sure we don't leak our inner object by leaving a reference in
-         * the global registry:
-         */
-        //let reg = Registry::obtain();
-        //reg.unregister(&self.inner);
     }
 }
 
 struct DoorClient {
-    file: File,
+    fd: OwnedFd,
     server_pid: libc::pid_t,
+}
+
+impl TryFrom<OwnedFd> for DoorClient {
+    type Error = anyhow::Error;
+
+    fn try_from(fd: OwnedFd) -> Result<Self> {
+        let mut info: sys::DoorInfo = unsafe { std::mem::zeroed() };
+        let r = unsafe { sys::door_info(fd.as_raw_fd(), &mut info) };
+        if r != 0 {
+            let e = std::io::Error::last_os_error();
+            bail!("could not get door info: {e}");
+        }
+        println!("client info = {:#?}", info);
+
+        Ok(DoorClient { fd, server_pid: info.di_target })
+    }
 }
 
 impl DoorClient {
@@ -987,48 +906,21 @@ impl DoorClient {
         let file = File::open(path)
             .map_err(|e| anyhow!("opening door {path:?}: {e}"))?;
 
-        let fd = file.as_raw_fd();
+        let fd: OwnedFd = file.into();
 
         let mut info: sys::DoorInfo = unsafe { std::mem::zeroed() };
-        let r = unsafe { sys::door_info(fd, &mut info) };
+        let r = unsafe { sys::door_info(fd.as_raw_fd(), &mut info) };
         if r != 0 {
             let e = std::io::Error::last_os_error();
             bail!("could not get door info: {e}");
         }
 
         println!("info = {:#?}", info);
-        Ok(DoorClient { file, server_pid: info.di_target })
-    }
-
-    fn dup_fd(fd: c_int) -> Result<DoorClient> {
-        /*
-         * Duplicate the file descriptor so that we can close it without
-         * affecting the original.
-         */
-        let fd = unsafe {
-            libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, libc::STDERR_FILENO + 1)
-        };
-        if fd < 0 {
-            let e = std::io::Error::last_os_error();
-            bail!("could not dup door fd: {e}");
-        }
-
-        let mut info: sys::DoorInfo = unsafe { std::mem::zeroed() };
-        let r = unsafe { sys::door_info(fd, &mut info) };
-        if r != 0 {
-            unsafe { libc::close(fd) };
-            let e = std::io::Error::last_os_error();
-            bail!("could not get door info: {e}");
-        }
-
-        let file = unsafe { File::from_raw_fd(fd) };
-
-        println!("client info = {:#?}", info);
-        Ok(DoorClient { file, server_pid: info.di_target })
+        Ok(DoorClient { fd, server_pid: info.di_target })
     }
 
     fn call(&self) -> Result<()> {
-        let fd = self.file.as_raw_fd();
+        let fd = self.fd.as_raw_fd();
 
         let mut arg = sys::DoorArg {
             data_ptr: std::ptr::null_mut(),
@@ -1112,17 +1004,20 @@ fn main() -> Result<()> {
 
     println!("door server started; pid {}", std::process::id());
 
-    //    /*
-    //     * Can we call our own door server?
-    //     */
-    //    println!("---- own server:");
-    //    let dc = DoorClient::dup_fd(d.door_fd())?;
-    //    dc.call()?;
-    //    dc.call()?;
-    //    dc.call()?;
-    //    dc.call()?;
-    //    drop(dc);
-    //    println!("---- own server^");
+    {
+        /*
+         * Can we call our own door server?
+         */
+        println!("---- own server:");
+
+        let dc = DoorClient::try_from(d.door_fd().try_clone_to_owned()?)?;
+        dc.call()?;
+        dc.call()?;
+        dc.call()?;
+        dc.call()?;
+        drop(dc);
+        println!("---- own server^");
+    }
 
     println!("waiting for unref...");
     d.wait_for_unref();
