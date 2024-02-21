@@ -8,7 +8,8 @@ pub type ServerProcedureFn =
 
 pub type CreateProcFn = extern "C" fn(*mut DoorInfo);
 
-#[repr(C)]
+#[derive(Debug)]
+#[repr(C, packed(4))]
 pub struct DoorInfo {
     pub di_target: pid_t,
     pub di_proc: *const c_void,
@@ -18,12 +19,44 @@ pub struct DoorInfo {
     pub di_resv: [c_int; 4],
 }
 
+#[repr(C, packed(4))]
+pub struct DoorDesc {
+    pub d_attributes: c_uint,
+    pub d_data: DoorDescData,
+}
+
+#[repr(C)]
+pub union DoorDescData {
+    pub d_desc: DoorDescDataFd,
+    pub d_resv: c_int,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct DoorDescDataFd {
+    pub d_descriptor: c_int,
+    pub d_id: c_ulonglong,
+}
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct DoorArg {
+    pub data_ptr: *mut c_char,
+    pub data_size: size_t,
+    pub desc_ptr: *mut DoorDesc,
+    pub desc_num: c_uint,
+    pub rbuf: *mut c_char,
+    pub rsize: size_t,
+}
+
 extern "C" {
     pub fn door_create(
         server_procedure: ServerProcedureFn,
         cookie: *mut c_void,
         attributes: c_uint,
     ) -> c_int;
+
+    pub fn door_revoke(d: c_int) -> c_int;
 
     /**
      * Associates the current thread with a door server pool.  Doors created
@@ -38,6 +71,7 @@ extern "C" {
     pub fn door_unbind() -> c_int;
 
     pub fn fattach(fildes: c_int, path: *const c_char) -> c_int;
+    pub fn fdetach(path: *const c_char) -> c_int;
 
     pub fn door_return(
         data_ptr: *mut c_char,
@@ -46,7 +80,11 @@ extern "C" {
         num_desc: c_uint,
     ) -> c_int;
 
+    pub fn door_call(d: c_int, params: *mut DoorArg) -> c_int;
+
     pub fn door_server_create(create_proc: CreateProcFn) -> CreateProcFn;
+
+    pub fn door_info(d: c_int, info: *mut DoorInfo) -> c_int;
 
     pub fn pthread_setcancelstate(state: c_int, oldstate: *mut c_int) -> c_int;
 
@@ -58,6 +96,10 @@ extern "C" {
         flags: c_long,
         new_thread_id: *mut c_uint,
     ) -> c_int;
+
+    pub fn thr_setname(tid: c_uint, name: *const c_char) -> c_int;
+
+    pub fn thr_self() -> c_uint;
 }
 
 pub const PTHREAD_CANCEL_DISABLE: c_int = 0x01;
