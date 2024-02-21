@@ -6,7 +6,7 @@ use std::{
     fs::File,
     io::ErrorKind,
     os::{
-        fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+        fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, IntoRawFd},
         unix::prelude::OsStrExt,
     },
     panic::RefUnwindSafe,
@@ -17,7 +17,7 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Result};
-use libc::{c_char, c_int, c_uint, c_void, size_t};
+use libc::{c_char, c_uint, c_void, size_t};
 use once_cell::sync::OnceCell;
 
 static ORIGINAL_CREATE_PROC: OnceCell<sys::CreateProcFn> = OnceCell::new();
@@ -73,7 +73,7 @@ struct DoorInner {
 }
 
 struct DoorLocked {
-    fd: Option<c_int>,
+    fd: Option<OwnedFd>,
     unref: bool,
     state: ServerState,
     threads: Vec<Arc<ServerThread>>,
@@ -99,8 +99,8 @@ where
 impl Drop for DoorInner {
     fn drop(&mut self) {
         let locked = self.locked.get_mut().unwrap();
-        if let Some(fd) = locked.fd {
-            panic!("door server: inner object dropped with open fd {fd}");
+        if let Some(fd) = locked.fd.as_ref() {
+            panic!("door server: inner object dropped with open fd {fd:?}");
         }
 
         if !locked.threads.is_empty() {
@@ -369,8 +369,8 @@ extern "C" fn rust_door_thread(arg: *mut c_void) -> *mut c_void {
                     }
                 }
 
-                if let Some(fd) = locked.fd {
-                    break fd;
+                if let Some(fd) = locked.fd.as_ref() {
+                    break fd.as_raw_fd();
                 } else {
                     locked = di.cv.wait(locked).unwrap();
                 }
@@ -615,18 +615,35 @@ impl Door {
             bail!("could not create a door: {e}");
         }
 
-        d.inner.locked.lock().unwrap().fd = Some(fd);
+        d.inner.locked.lock().unwrap().fd =
+            Some(unsafe { OwnedFd::from_raw_fd(fd) });
         d.inner.cv.notify_all();
 
         Ok(d)
     }
 
-    fn door_fd(&self) -> BorrowedFd {
-        let fd = self.inner.locked.lock().unwrap().fd.unwrap();
-        unsafe { BorrowedFd::borrow_raw(fd) }
+    fn self_client(&self) -> Result<DoorClient> {
+        let fd = if let Some(fd) = self.inner.locked.lock().unwrap().fd.as_ref()
+        {
+            fd.try_clone()?
+        } else {
+            bail!("could not create door client for this door");
+        };
+
+        Ok(DoorClient {
+            fd,
+            server_pid: std::process::id().try_into().unwrap(),
+        })
     }
 
     fn attach_impl(&self, path: &Path, force: bool) -> Result<()> {
+        let mut locked = self.inner.locked.lock().unwrap();
+
+        let fd = match (&locked.state, &locked.fd) {
+            (ServerState::Created, Some(fd)) => fd.as_raw_fd(),
+            _ => bail!("cannot attach a door that is being revoked"),
+        };
+
         let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
 
         println!("REF 3: {}", Arc::strong_count(&self.inner));
@@ -656,8 +673,7 @@ impl Door {
             .open(&path)
             .map_err(|e| anyhow!("creating {path:?}: {e}"))?;
 
-        let r =
-            unsafe { sys::fattach(self.door_fd().as_raw_fd(), cpath.as_ptr()) };
+        let r = unsafe { sys::fattach(fd, cpath.as_ptr()) };
         if r != 0 {
             let e = std::io::Error::last_os_error();
             bail!("unable to attach at {path:?}: {e}");
@@ -686,10 +702,42 @@ impl Door {
 
     fn revoke(&self) -> Result<()> {
         /*
+         * We need to shut down each thread that is parked waiting to service a
+         * door call.  This is perhaps surprisingly intricate: a thread parked
+         * in door_return() waiting to service a call will unfortunately block
+         * forever, even if it is bound to a particular private pool and the
+         * door for that pool has been revoked.  Even though we have a list of
+         * thread IDs for all of our private pool threads, we cannot use
+         * thr_kill(3C) to kick them out because the door return logic always
+         * restarts on EINTR without returning to code that we control.
+         *
+         * The only apparent way to kick these threads out is to make a door
+         * call that wakes them up.  We can't control which thread will service
+         * a particular invocation of door_call(3C), but if we keep calling it,
+         * and have our service procedure merely exit because we've marked the
+         * thread for shutdown, we'll eventually get them all.
+         *
+         * There is a wrinkle: though we continue to progress to the point where
+         * the door is revoked, we are not there yet!  Calls could still come
+         * from outside the process, because there is nothing to stop a process
+         * from keeping a door descriptor open for a long time even though we
+         * may have detached it from the file system.  A call to door_call(3C)
+         * will block waiting for a thread, and if no such thread happens to
+         * exist because another process got to it first, we will block forever
+         * -- or until the door is revoked.
+         *
+         * To avoid blocking this thread, we start _another_ thread whose sole
+         * job is to make frenetic meaningless door calls until we have, here,
+         * determined that there are no threads left to wake up.  At that time,
+         * we'll revoke the door and then join our helper thread.  Note that to
+         * avoid a race with our helper thread we must duplicate our original
+         * file descriptor here; door_revoke(3C) will, as a side effect,
+         * close(2) our original fd.
+         *
          * First, mark the per-door object so that no more threads will be
          * created.
          */
-        let (fd, threads) = {
+        let (helper_fd, threads) = {
             let mut locked = self.inner.locked.lock().unwrap();
 
             loop {
@@ -716,6 +764,15 @@ impl Door {
                 }
             }
 
+            let fd = if let Some(fd) = &locked.fd {
+                fd.try_clone()?
+            } else {
+                /*
+                 * XXX big if true
+                 */
+                bail!("no fd for door server");
+            };
+
             println!("REVOKE: marking stopped...");
             locked.state = ServerState::Stopping;
             self.inner.cv.notify_all();
@@ -728,61 +785,8 @@ impl Door {
                 st.cv.notify_all();
             }
 
-            (
-                locked.fd,
-                std::mem::replace(&mut locked.threads, Default::default()),
-            )
+            (fd, std::mem::replace(&mut locked.threads, Default::default()))
         };
-
-        let Some(fd) = fd else {
-            /*
-             * XXX
-             */
-            bail!("already closed?");
-        };
-
-        /*
-         * Next, we need to shut down each thread that is parked waiting to
-         * service a door call.  This is perhaps surprisingly intricate: a
-         * thread parked in door_return() waiting to service a call will
-         * unfortunately block forever, even if it is bound to a particular
-         * private pool and the door for that pool has been revoked.  Even
-         * though we have a list of thread IDs for all of our private pool
-         * threads, we cannot use thr_kill(3C) to kick them out because the door
-         * return logic always restarts on EINTR without returning to code that
-         * we control.
-         *
-         * The only apparent way to kick these threads out is to make a door
-         * call that wakes them up.  We can't control which thread will service
-         * a particular invocation of door_call(3C), but if we keep calling it,
-         * and have our service procedure merely exit because we've marked the
-         * thread for shutdown, we'll eventually get them all.
-         *
-         * There is a wrinkle: though we continue to progress to the point where
-         * the door is revoked, we are not there yet!  Calls could still come
-         * from outside the process, because there is nothing to stop a process
-         * from keeping a door descriptor open for a long time even though we
-         * may have detached it from the file system.  A call to door_call(3C)
-         * will block waiting for a thread, and if no such thread happens to
-         * exist because another process got to it first, we will block forever
-         * -- or until the door is revoked.
-         *
-         * To avoid blocking this thread, we start _another_ thread whose sole
-         * job is to make frenetic meaningless door calls until we have, here,
-         * determined that there are no threads left to wake up.  At that time,
-         * we'll revoke the door and then join our helper thread.  Note that to
-         * avoid a race with our helper thread we must duplicate our original
-         * file descriptor here; door_revoke(3C) will, as a side effect,
-         * close(2) our original fd.
-         */
-
-        let other_fd = unsafe {
-            libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, libc::STDERR_FILENO + 1)
-        };
-        if other_fd < 0 {
-            let e = std::io::Error::last_os_error();
-            bail!("could not dup door fd: {e}");
-        }
 
         println!("REVOKE: starting helper...");
         let jh = std::thread::spawn(move || loop {
@@ -796,7 +800,7 @@ impl Door {
                 rsize: 0,
             };
 
-            let r = unsafe { sys::door_call(other_fd, &mut arg) };
+            let r = unsafe { sys::door_call(helper_fd.as_raw_fd(), &mut arg) };
             let e = unsafe { *libc::___errno() };
             if r != 0 && e == libc::EBADF {
                 /*
@@ -805,7 +809,6 @@ impl Door {
                  * a programming error with the file descriptor, and
                  * accidentally closed it before we meant to.
                  */
-                assert_eq!(unsafe { libc::close(other_fd) }, 0);
                 return;
             }
 
@@ -837,9 +840,28 @@ impl Door {
             std::thread::yield_now();
         }
 
+        let fd = {
+            let mut locked = self.inner.locked.lock().unwrap();
+            let Some(fd) = locked.fd.take() else {
+                /*
+                 * XXX
+                 */
+                bail!("fd is gone?!");
+            };
+
+            /*
+             * Make sure OwnedFd doesn't close the file descriptor; we'll do
+             * that ourselves with door_revoke().
+             */
+            fd.into_raw_fd()
+        };
+
         let r = unsafe { sys::door_revoke(fd) };
         let e = unsafe { *libc::___errno() };
         if r != 0 {
+            /*
+             * XXX probably leaking the fd here...
+             */
             bail!("door_revoke failed -- r {r} e {e}");
         }
 
@@ -848,7 +870,7 @@ impl Door {
 
         println!("REVOKE: ok!");
         let mut locked = self.inner.locked.lock().unwrap();
-        assert!(locked.fd.take().is_some());
+        assert!(locked.fd.is_none());
         locked.state = ServerState::Stopped;
         self.inner.cv.notify_all();
 
@@ -1010,7 +1032,7 @@ fn main() -> Result<()> {
          */
         println!("---- own server:");
 
-        let dc = DoorClient::try_from(d.door_fd().try_clone_to_owned()?)?;
+        let dc = d.self_client()?;
         dc.call()?;
         dc.call()?;
         dc.call()?;
