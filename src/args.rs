@@ -1,5 +1,5 @@
-use crate::sys;
 use crate::server::RBUF_MAX;
+use crate::sys;
 
 #[allow(unused)]
 pub struct DoorArg<'a> {

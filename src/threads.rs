@@ -1,8 +1,8 @@
 use std::{
+    cell::RefCell,
     ffi::CString,
     os::fd::AsRawFd,
     sync::{Arc, Condvar, Mutex, OnceLock, Weak},
-    cell::RefCell,
 };
 
 use crate::server::{rust_doors_server_proc, DoorInner, ServerState};
@@ -77,10 +77,25 @@ extern "C" fn rust_door_create_proc(infop: *mut sys::DoorInfo) {
     /*
      * Confirm that the door server procedure is our wrapper:
      */
-    if (info.di_attributes & sys::DOOR_PRIVATE) == 0
-        || info.di_proc != (rust_doors_server_proc as *mut c_void)
-    {
+    if info.di_proc != (rust_doors_server_proc as *mut c_void) {
         return rust_door_create_proc_fallback(infop);
+    }
+
+    /*
+     * Check some invariants:
+     */
+    let expected_attrs = sys::DOOR_UNREF
+        | sys::DOOR_REFUSE_DESC
+        | sys::DOOR_NO_CANCEL
+        | sys::DOOR_PRIVATE;
+    if (info.di_attributes & expected_attrs) != expected_attrs {
+        upanic(format!(
+            "some expected attributes missing: 0x{:x} != 0x{:x}",
+            info.di_attributes, expected_attrs,
+        ));
+    }
+    if info.di_data.is_null() {
+        upanic("inner door object missing");
     }
 
     /*

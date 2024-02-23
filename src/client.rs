@@ -97,20 +97,28 @@ impl DoorResult {
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                self.arg.data_ptr as *const u8,
-                self.arg.data_size,
-            )
+        if self.arg.data_ptr.is_null() || self.arg.data_size == 0 {
+            &[]
+        } else {
+            unsafe {
+                std::slice::from_raw_parts(
+                    self.arg.data_ptr as *const u8,
+                    self.arg.data_size,
+                )
+            }
         }
     }
 
     pub fn descriptors(&self) -> &[sys::DoorDesc] {
-        unsafe {
-            std::slice::from_raw_parts(
-                self.arg.desc_ptr,
-                self.arg.desc_num.try_into().unwrap(),
-            )
+        if self.arg.desc_ptr.is_null() || self.arg.desc_num == 0 {
+            &[]
+        } else {
+            unsafe {
+                std::slice::from_raw_parts(
+                    self.arg.desc_ptr,
+                    self.arg.desc_num.try_into().unwrap(),
+                )
+            }
         }
     }
 }
