@@ -1,12 +1,14 @@
 #![allow(unused_imports)]
 
 use std::{
-    cell::RefCell,
+    any::Any,
+    cell::{RefCell, UnsafeCell},
     ffi::CString,
     fs::File,
     io::ErrorKind,
+    mem::MaybeUninit,
     os::{
-        fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, IntoRawFd},
+        fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
         unix::prelude::OsStrExt,
     },
     panic::RefUnwindSafe,
@@ -17,10 +19,14 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Result};
+use client::DoorClient;
 use libc::{c_char, c_uint, c_void, size_t};
 use once_cell::sync::OnceCell;
 
-static ORIGINAL_CREATE_PROC: OnceCell<sys::CreateProcFn> = OnceCell::new();
+pub mod client;
+
+static ORIGINAL_CREATE_PROC: OnceCell<Option<sys::CreateProcFn>> =
+    OnceCell::new();
 
 thread_local! {
     static DOOR_SERVER_THREAD: RefCell<*const ServerThread> = const {
@@ -52,8 +58,132 @@ enum ServerThreadState {
 #[allow(unused)]
 mod sys;
 
+fn upanic<S: AsRef<str>>(msg: S) -> ! {
+    let msg = msg.as_ref();
+    let b = msg.as_bytes();
+    unsafe { sys::upanic(b.as_ptr() as *const c_char, b.len()) };
+}
+
+fn upanic_if_unwound<R>(
+    msg: &'static str,
+    res: std::result::Result<R, Box<dyn Any + Send>>,
+) -> R {
+    match res {
+        Ok(res) => res,
+        Err(payload) => {
+            let storage;
+            let msg = match payload.downcast_ref::<&'static str>() {
+                Some(detail) => {
+                    storage = format!("{msg}: {detail}");
+                    &storage
+                }
+                None => match payload.downcast_ref::<String>() {
+                    Some(detail) => {
+                        storage = format!("{msg}: {detail}");
+                        &storage
+                    }
+                    None => msg,
+                },
+            };
+
+            upanic(msg);
+        }
+    }
+}
+
+#[allow(unused)]
+struct Arg<'a> {
+    arg: &'a [u8],
+    descs: &'a [sys::DoorDesc],
+    return_buffer: *mut [u8; RBUF_MAX],
+}
+
+impl<'a> Arg<'a> {
+    fn as_bytes(&self) -> &[u8] {
+        self.arg
+    }
+
+    fn make_return(&mut self) -> ReturnBuilder {
+        /*
+         * It's vital that we do not allow more than one mutable alias to the
+         * underlying storage for the return buffer.
+         */
+        let buf =
+            std::mem::replace(&mut self.return_buffer, std::ptr::null_mut());
+        if buf.is_null() {
+            panic!("cannot call make_return() twice");
+        }
+
+        ReturnBuilder { buf }
+    }
+}
+
+pub struct ReturnBuilder {
+    buf: *mut [u8; RBUF_MAX],
+}
+
+#[allow(unused)]
+impl ReturnBuilder {
+    fn buf(&mut self) -> &mut [u8; RBUF_MAX] {
+        unsafe { &mut *self.buf }
+    }
+
+    fn u64(mut self, val: u64) -> Return {
+        let buf = self.buf();
+
+        let encoded = val.to_ne_bytes();
+        buf[0..encoded.len()].copy_from_slice(&encoded);
+        Return { len: encoded.len() }
+    }
+
+    fn i64(mut self, val: i64) -> Return {
+        let buf = self.buf();
+
+        let encoded = val.to_ne_bytes();
+        buf[0..encoded.len()].copy_from_slice(&encoded);
+        Return { len: encoded.len() }
+    }
+
+    fn u32(mut self, val: u32) -> Return {
+        let buf = self.buf();
+
+        let encoded = val.to_ne_bytes();
+        buf[0..encoded.len()].copy_from_slice(&encoded);
+        Return { len: encoded.len() }
+    }
+
+    fn i32(mut self, val: i32) -> Return {
+        let buf = self.buf();
+
+        let encoded = val.to_ne_bytes();
+        buf[0..encoded.len()].copy_from_slice(&encoded);
+        Return { len: encoded.len() }
+    }
+
+    fn string<S: AsRef<str>>(mut self, val: S) -> Return {
+        let buf = self.buf();
+
+        let val = val.as_ref();
+        let encoded = val.as_bytes();
+        assert!(encoded.len() < buf.len());
+        buf[0..encoded.len()].copy_from_slice(encoded);
+        buf[encoded.len()] = b'\0';
+        Return { len: encoded.len() + 1 }
+    }
+
+    fn raw(mut self, func: impl FnOnce(&mut [u8]) -> usize) -> Return {
+        let buf = self.buf();
+        let len = func(buf);
+
+        assert!(len <= buf.len());
+        Return { len }
+    }
+}
+
 #[derive(Debug)]
-struct Arg {}
+struct Return {
+    len: usize,
+}
 
 struct Door {
     inner: Arc<DoorInner>,
@@ -84,15 +214,15 @@ struct DoorFuncBox<F> {
 }
 
 trait DoorFuncBoxCall: Sync + Send + RefUnwindSafe {
-    fn call(&self, a: Arg);
+    fn call(&self, a: Arg) -> Return;
 }
 
 impl<F> DoorFuncBoxCall for DoorFuncBox<F>
 where
-    F: Sync + Send + Fn(Arg) + RefUnwindSafe,
+    F: Sync + Send + Fn(Arg) -> Return + RefUnwindSafe,
 {
-    fn call(&self, a: Arg) {
-        (self.func)(a);
+    fn call(&self, a: Arg) -> Return {
+        (self.func)(a)
     }
 }
 
@@ -109,32 +239,29 @@ impl Drop for DoorInner {
                 locked.threads
             );
         }
+    }
+}
 
-        println!("door inner object dropped");
+#[no_mangle]
+extern "C" fn rust_door_create_proc_fallback(infop: *mut sys::DoorInfo) {
+    /*
+     * Delegate to the original server thread creation routine if one
+     * existed when we registered ours
+     */
+    if let Some(Some(create_proc)) = ORIGINAL_CREATE_PROC.get() {
+        create_proc(infop);
     }
 }
 
 #[no_mangle]
 extern "C" fn rust_door_create_proc(infop: *mut sys::DoorInfo) {
-    println!("rust_door_create_proc(0x{:x})", infop as usize);
-
     /*
      * Make sure this door is one created with DOOR_PRIVATE; i.e., that we were
      * passed a door_info_t:
      */
-    let info = unsafe { infop.as_ref() };
-    let Some(info) = info else {
-        if let Some(create_proc) = ORIGINAL_CREATE_PROC.get() {
-            /*
-             * Delegate to the original server thread creation routine if one
-             * existed when we registered ours:
-             */
-            create_proc(infop);
-        }
-        return;
+    let Some(info) = (unsafe { infop.as_ref() }) else {
+        return rust_door_create_proc_fallback(infop);
     };
-
-    println!("rust_door_create_proc({info:#?})");
 
     /*
      * Confirm that the door server procedure is our wrapper:
@@ -142,119 +269,121 @@ extern "C" fn rust_door_create_proc(infop: *mut sys::DoorInfo) {
     if (info.di_attributes & sys::DOOR_PRIVATE) == 0
         || info.di_proc != (rust_doors_server_proc as *mut c_void)
     {
-        println!("rust_door_create_proc({info:#?}): not our wrapper?");
-        if let Some(create_proc) = ORIGINAL_CREATE_PROC.get() {
-            create_proc(infop);
-        }
-        return;
+        return rust_door_create_proc_fallback(infop);
     }
 
     /*
      * From this point forward, we are confident that we own the door and there
      * should be no chaining to other thread creation functions.
      *
-     * It should be safe to use the reference to our inner door object here in
-     * the thread creation callback.  This callback is only called with our
-     * cookie value during a door_call(3C) or a door_return(3C).  In the
-     * DOOR_PRIVATE model we have control of when both of those calls occur:
-     * either initially during our constructor, or within one of our managed
-     * threads created below.
+     * Allow the rest of this routine to use panic!() if needed.  We'll promote
+     * that panic to a upanic().
      */
-    let (weak_di, di) = {
-        let di = unsafe { Arc::from_raw(info.di_data as *const DoorInner) };
-        (Arc::downgrade(&di), unsafe { &*Arc::into_raw(di) })
-    };
+    let res = std::panic::catch_unwind(|| {
+        /*
+         * It should be safe to use the reference to our inner door object here
+         * in the thread creation callback.  This callback is only called with
+         * our cookie value during a door_call(3C) or a door_return(3C).  In the
+         * DOOR_PRIVATE model we have control of when both of those calls occur:
+         * either initially during our constructor, or within one of our managed
+         * threads created below.
+         */
+        let (weak_di, di) = {
+            let di = unsafe { Arc::from_raw(info.di_data as *const DoorInner) };
+            (Arc::downgrade(&di), unsafe { &*Arc::into_raw(di) })
+        };
 
-    let st = Arc::new(ServerThread {
-        locked: Mutex::new(ServerThreadLocked {
-            thread_id: None,
-            state: ServerThreadState::Created,
-            door: Some(weak_di),
-            shutdown: false,
-        }),
-        cv: Default::default(),
-    });
+        let st = Arc::new(ServerThread {
+            locked: Mutex::new(ServerThreadLocked {
+                thread_id: None,
+                state: ServerThreadState::Created,
+                door: Some(weak_di),
+                shutdown: false,
+            }),
+            cv: Default::default(),
+        });
 
-    /*
-     * Make sure we are still supposed to be creating threads, and if so,
-     * register this one.  Registration needs to occur prior to creating the
-     * thread so that we don't end up racing with a revocation.
-     */
-    {
-        let mut locked = di.locked.lock().unwrap();
+        /*
+         * Make sure we are still supposed to be creating threads, and if so,
+         * register this one.  Registration needs to occur prior to creating the
+         * thread so that we don't end up racing with a revocation.
+         */
+        {
+            let mut locked = di.locked.lock().unwrap();
 
-        match locked.state {
-            ServerState::Created => (),
-            ServerState::Stopping => {
-                println!("DCP: door is stopping; NO MORE THREADS!");
-                return;
+            match locked.state {
+                ServerState::Created => (),
+                ServerState::Stopping => {
+                    return;
+                }
+                ServerState::Stopped => {
+                    panic!("thread creation after door server stopped?");
+                }
             }
-            ServerState::Stopped => {
-                panic!("DCP: thread creation after door server stopped?");
-            }
+
+            locked.threads.push(Arc::clone(&st));
         }
 
-        locked.threads.push(Arc::clone(&st));
-    }
-
-    println!("DCP: creating a door thread for {:x} ...", info.di_data as usize);
-
-    /*
-     * Create a thread and pass the door data to it.
-     */
-    let arg = Arc::into_raw(Arc::clone(&st));
-
-    let mut tid: c_uint = 0;
-    let r = unsafe {
-        sys::thr_create(
-            std::ptr::null_mut(),
-            0,
-            rust_door_thread,
-            arg as *mut c_void,
-            sys::THR_DETACHED,
-            &mut tid,
-        )
-    };
-
-    if r == 0 {
         /*
-         * Stash the thread ID in the server thread object for debugging
-         * purposes:
+         * Create a thread and pass the door data to it.
          */
-        st.locked.lock().unwrap().thread_id = Some(tid);
-        st.cv.notify_all();
+        let arg = Arc::into_raw(Arc::clone(&st));
+
+        let mut tid: c_uint = 0;
+        let r = unsafe {
+            sys::thr_create(
+                std::ptr::null_mut(),
+                0,
+                rust_door_thread,
+                arg as *mut c_void,
+                sys::THR_DETACHED,
+                &mut tid,
+            )
+        };
+
+        if r == 0 {
+            /*
+             * Stash the thread ID in the server thread object for debugging
+             * purposes:
+             */
+            st.locked.lock().unwrap().thread_id = Some(tid);
+            st.cv.notify_all();
+
+            /*
+             * Thread creation was successful.  Attempt to set the name for
+             * diagnostic purposes.
+             */
+            let name =
+                CString::new(format!("doorserver-{:x}", info.di_data as usize))
+                    .unwrap();
+            unsafe { sys::thr_setname(tid, name.as_ptr()) };
+
+            /*
+             * Yield to allow it to begin running, like the default
+             * implementation in libc does.
+             */
+            std::thread::yield_now();
+            return;
+        }
 
         /*
-         * Thread creation was successful.  Attempt to set the name for
-         * diagnostic purposes.
+         * Thread creation was not successful so we'll need to take the
+         * reference back so that we can drop it.
          */
-        let name =
-            CString::new(format!("doorserver-{:x}", info.di_data as usize))
-                .unwrap();
-        unsafe { sys::thr_setname(tid, name.as_ptr()) };
+        let _ = unsafe { Arc::from_raw(arg) };
 
         /*
-         * Yield to allow it to begin running, like the default implementation
-         * in libc does.
+         * XXX error channel?
          */
-        std::thread::yield_now();
-        return;
-    }
+        let e = std::io::Error::from_raw_os_error(r);
+        eprintln!("WARNING: door thread creation failed: {e}"); /* XXX */
+    });
 
-    /*
-     * Thread creation was not successful so we'll need to take the reference
-     * back so that we can drop it.
-     */
-    let _ = unsafe { Arc::from_raw(arg) };
-
-    let e = std::io::Error::from_raw_os_error(r);
-    eprintln!("WARNING: door thread creation failed: {e}"); /* XXX */
+    upanic_if_unwound("panic in door thread creation", res);
 }
 
 #[no_mangle]
-extern "C" fn rust_door_thread_exit() -> *mut c_void {
-    let tid = unsafe { sys::thr_self() };
-
+fn rust_door_thread_exit() {
     /*
      * Take the thread-local door inner pointer and replace it with NULL.
      */
@@ -266,11 +395,10 @@ extern "C" fn rust_door_thread_exit() -> *mut c_void {
      */
     let st: Arc<ServerThread> = if st.is_null() {
         /*
-         * XXX This is very bad.  Our thread local should have been established
-         * very early in door thread startup.
+         * This is very bad.  Our thread local should have been established very
+         * early in door thread startup.
          */
-        eprintln!("[{tid}] NO SERVER THREAD; ABORT");
-        std::process::abort();
+        upanic("per-thread object was not present");
     } else {
         unsafe { Arc::from_raw(st) }
     };
@@ -283,8 +411,43 @@ extern "C" fn rust_door_thread_exit() -> *mut c_void {
     locked.state = ServerThreadState::Exited;
     locked.door.take();
     st.cv.notify_all();
+}
 
-    println!("[{tid}] DOOR THREAD EXIT");
+#[no_mangle]
+extern "C" fn rust_door_thread(arg: *mut c_void) -> *mut c_void {
+    let res = std::panic::catch_unwind(|| {
+        /*
+         * When this thread was created, rust_door_create_proc() passed us a raw
+         * pointer created from a Arc<ServerThread>.  We do not convert it back
+         * to an Arc here because we do not wish to accidentally drop it.  This
+         * function may or may not return all the way, depending on what happens
+         * in door calls serviced on this thread.
+         *
+         * Most of the heavy lifting occurs in this inner function so that we
+         * can use Rust facilities that might panic, and so that drop calls
+         * occur naturally for things like mutex guards before we end up back
+         * here.
+         */
+        if !rust_door_thread_impl(arg as *const ServerThread) {
+            /*
+             * We didn't get all the way off the ground.  Return through the
+             * cleanup path.
+             */
+            return rust_door_thread_exit();
+        }
+
+        /*
+         * Calling door_return(3C) with all zero values informs the OS that this
+         * thread is ready to service door calls.  This call should not return.
+         */
+        let r = unsafe {
+            sys::door_return(std::ptr::null_mut(), 0, std::ptr::null_mut(), 0)
+        };
+        let e = unsafe { *libc::___errno() };
+        upanic(format!("back from door return (r {r} e {e})"));
+    });
+
+    upanic_if_unwound("door thread panic", res);
 
     /*
      * Door server threads are detached, so their return value is always
@@ -294,20 +457,7 @@ extern "C" fn rust_door_thread_exit() -> *mut c_void {
 }
 
 #[no_mangle]
-extern "C" fn rust_door_thread(arg: *mut c_void) -> *mut c_void {
-    let tid = unsafe { sys::thr_self() };
-
-    println!("[{tid}] door thread starting");
-
-    /*
-     * When this thread was created, rust_door_create_proc() passed us a raw
-     * pointer created from a Arc<ServerThread>.  We do not convert it back to
-     * an Arc here because we do not wish to accidentally drop it.  This
-     * function may or may not return all the way, depending on what happens in
-     * door calls serviced on this thread.
-     */
-    let st = arg as *const ServerThread;
-
+fn rust_door_thread_impl(st: *const ServerThread) -> bool {
     /*
      * Stash the door info pointer in our thread local so that we can find it
      * later.  We consider the reference parked here, and thus safe to use from
@@ -329,14 +479,13 @@ extern "C" fn rust_door_thread(arg: *mut c_void) -> *mut c_void {
          * object.  Upgrade that reference so we can interact with it here:
          */
         let di = {
-            let mut locked = st.locked.lock().unwrap();
+            let locked = st.locked.lock().unwrap();
 
             if locked.shutdown {
                 /*
                  * Our shutdown has been requested, just give up now.
                  */
-                drop(locked);
-                return rust_door_thread_exit();
+                return false;
             }
 
             if let Some(di) = locked.door.as_ref().and_then(|di| di.upgrade()) {
@@ -345,8 +494,7 @@ extern "C" fn rust_door_thread(arg: *mut c_void) -> *mut c_void {
                 /*
                  * If the inner door object no longer exists, just bail out.
                  */
-                drop(locked);
-                return rust_door_thread_exit();
+                return false;
             }
         };
 
@@ -361,11 +509,10 @@ extern "C" fn rust_door_thread(arg: *mut c_void) -> *mut c_void {
                          * This door is being shut down, so we don't want to
                          * create any more threads.
                          */
-                        drop(locked);
-                        return rust_door_thread_exit();
+                        return false;
                     }
                     ServerState::Stopped => {
-                        panic!("blah");
+                        panic!("door thread create after door server stopped?");
                     }
                 }
 
@@ -376,11 +523,6 @@ extern "C" fn rust_door_thread(arg: *mut c_void) -> *mut c_void {
                 }
             }
         };
-
-        println!(
-            "[{tid}] door thread for {:x}, fd {fd}",
-            std::ptr::addr_of!(di) as usize,
-        );
 
         fd
     };
@@ -400,9 +542,13 @@ extern "C" fn rust_door_thread(arg: *mut c_void) -> *mut c_void {
      * created, not the global pool.
      */
     if unsafe { sys::door_bind(fd) } == -1 {
-        return rust_door_thread_exit();
+        return false;
     }
 
+    /*
+     * Announce that we have succesfully bound this thread to the private pool
+     * for the door.
+     */
     {
         let mut locked = st.locked.lock().unwrap();
         assert!(matches!(locked.state, ServerThreadState::Created));
@@ -410,32 +556,136 @@ extern "C" fn rust_door_thread(arg: *mut c_void) -> *mut c_void {
         st.cv.notify_all();
     }
 
-    /*
-     * Calling door_return(3C) with all zero values informs the OS that this
-     * thread is ready to service door calls.  This call should not return.
-     */
-    let r = unsafe {
-        sys::door_return(std::ptr::null_mut(), 0, std::ptr::null_mut(), 0)
-    };
-    let e = unsafe { *libc::___errno() };
-
-    /*
-     * XXX upanic here
-     */
-    eprintln!("[{tid}] OH NO, back from door return?! (r {r} e {e})");
-    std::process::abort();
+    true
 }
+
+/**
+ * The maximum size of the return value buffer on the stack in the door server
+ * procedure.
+ */
+const RBUF_MAX: usize = 64 * 1024;
 
 #[no_mangle]
 extern "C" fn rust_doors_server_proc(
     cookie: *mut c_void,
     argp: *mut c_char,
     arg_size: size_t,
-    dp: *mut sys::door_desc_t,
+    dp: *mut sys::DoorDesc,
     n_desc: c_uint,
 ) {
-    let tid = unsafe { sys::thr_self() };
+    /*
+     * Allocate a large buffer on the stack for return values.  After processing
+     * is complete, we must call door_return(3C) to submit results.  That call
+     * does not return so there is no opportunity for drop handlers to run.  If
+     * a larger return buffer is needed, we'll have to allocate from the heap
+     * and stash it in the thread-local structure to free it the next time we're
+     * woken up with a request.
+     */
+    let mut return_buffer: UnsafeCell<[u8; RBUF_MAX]> =
+        UnsafeCell::new([0u8; RBUF_MAX]);
 
+    let rbuf = return_buffer.get();
+
+    let res = std::panic::catch_unwind(|| {
+        /*
+         * The door server object holds a reference to the inner object on
+         * behalf of all threads.  The drop routine for that outer object will
+         * not complete until all threads have been torn down, so it's safe to
+         * use it here.
+         */
+        let di = cookie as *const DoorInner;
+
+        /*
+         * Because we created the door with DOOR_UNREF, if the door becomes
+         * unreferenced we'll get a special invocation with the magic
+         * DOOR_UNREF_DATA argument.  This can happen if the door path is
+         * detached with an fdetach(3C) call or the fdetach program.  Note that
+         * it does not strictly imply that there will be no further door calls.
+         */
+        let args = if argp == sys::DOOR_UNREF_DATA {
+            None
+        } else {
+            Some((
+                if argp.is_null() {
+                    [].as_slice()
+                } else {
+                    unsafe {
+                        std::slice::from_raw_parts(argp as *const u8, arg_size)
+                    }
+                },
+                if dp.is_null() {
+                    [].as_slice()
+                } else {
+                    unsafe {
+                        std::slice::from_raw_parts(
+                            dp as *const sys::DoorDesc,
+                            n_desc.try_into().unwrap(),
+                        )
+                    }
+                },
+            ))
+        };
+
+        if let Some(ret) = rust_doors_server_proc_impl(di, args, rbuf) {
+            Some(ret.len)
+        } else {
+            rust_door_thread_exit();
+            None
+        }
+    });
+
+    let Some(rbuflen) = upanic_if_unwound("executing door handler", res) else {
+        return;
+    };
+
+    let rbufp = return_buffer.get_mut().as_mut_ptr();
+    let r = unsafe {
+        /*
+         * NOTE: This call should not return.  This function must be careful not
+         * to create anything that needs to be dropped to function correctly.
+         */
+        sys::door_return(rbufp as *mut i8, rbuflen, std::ptr::null_mut(), 0)
+    };
+    if r != -1 {
+        upanic("door_return(3C) returned zero");
+    }
+
+    let e = unsafe { *libc::___errno() };
+    if e == libc::EMFILE || e == libc::E2BIG {
+        /*
+         * These can occur if the return value was too large for the client to
+         * handle, or the client was not prepared to receive as many file
+         * descriptors as we sent.
+         *
+         * XXX If we start allowing the return of file descriptors, it seems
+         * that it is our responsibility to clean them up in this instance.
+         */
+    }
+
+    /*
+     * XXX error channel?
+     */
+    eprintln!("DOOR RETURN FAILURE: e {e}");
+
+    /*
+     * If the client is not prepared to accept what we tried to return to them
+     * there are no particularly good options left.  We can induce an EINTR
+     * error in the client by exiting from this thread, which will at least not
+     * be an empty reply that the client could misinterpret as meaningful.
+     */
+    let res = std::panic::catch_unwind(|| {
+        rust_door_thread_exit();
+    });
+
+    upanic_if_unwound("exiting after failed door return", res);
+}
+
+#[no_mangle]
+fn rust_doors_server_proc_impl(
+    di: *const DoorInner,
+    arg: Option<(&[u8], &[sys::DoorDesc])>,
+    return_buffer: *mut [u8; RBUF_MAX],
+) -> Option<Return> {
     /*
      * Fish our per-thread object out of thread local storage, without creating
      * a new reference.
@@ -445,111 +695,54 @@ extern "C" fn rust_doors_server_proc(
         unsafe { &*st }
     };
 
-    /*
-     * The registry holds a reference to the per-door object and will refuse to
-     * drop it until all server threads have exited and more cannot be created.
-     */
-    let di = cookie as *const DoorInner;
-
-    /*
-     * Do some consistency checks between the per-thread object in our thread
-     * local storage and the per-door object we've been passed as the cookie.
-     */
     {
         let locked = st.locked.lock().unwrap();
+
         if locked.shutdown {
             /*
              * We're being torn down; don't look at anything else.
              */
-            drop(locked);
-            rust_door_thread_exit();
-            return;
+            return None;
         }
 
+        /*
+         * Do some consistency checks between the per-thread object in our
+         * thread local storage and the per-door object we've been passed as the
+         * cookie.
+         */
         if let Some(door) = locked.door.as_ref() {
             if door.as_ptr() != di {
-                /*
-                 * XXX upanic
-                 */
-                eprintln!(
-                    "[{tid}] INCONSISTENT {:x} != {:x}!",
+                upanic(format!(
+                    "inconsistent cookie: {:x} != {:x}",
                     door.as_ptr() as usize,
-                    di as usize
-                );
-                std::process::abort();
+                    di as usize,
+                ));
             }
         }
     }
 
     let di = unsafe { &*di };
 
-    /*
-     * Because we created the door with DOOR_UNREF, if the door becomes
-     * unreferenced we'll get a special invocation with the magic
-     * DOOR_UNREF_DATA argument.  This can happen if the door path is detached
-     * with an fdetach(3C) call or the fdetach program.  Note that it does not
-     * imply that there will be no further door calls.
-     */
-    if argp == sys::DOOR_UNREF_DATA {
-        println!("[{tid}] DOOR HAS BECOME UNREF!");
-
+    let Some((arg, descs)) = arg else {
+        /*
+         * If the door has become unreferenced, post that notification and exit
+         * the thread.
+         */
         di.locked.lock().unwrap().unref = true;
         di.cv.notify_all();
-
-        rust_door_thread_exit();
-        return;
-    }
-
-    println!("[{tid}] calling door func()...");
-    let res = std::panic::catch_unwind(|| {
-        /*
-         * The provided door function may panic and we want to be able to catch
-         * that and deal with it accordingly.
-         */
-        (di.func).call(Arg {});
-    });
-    println!("[{tid}] back from door func(): {res:?}");
-
-    if res.is_err() {
-        eprintln!("[{tid}] DOOR FUNCTION PANIC: {res:?}");
-
-        /*
-         * If we return from this function, the thread will just exit.  The
-         * client door_call(3C) invocation should fail with EINTR.
-         */
-        drop(res); /* XXX */
-        rust_door_thread_exit();
-        return;
-    }
-
-    drop(res); /* XXX */
-
-    let r = unsafe {
-        /*
-         * NOTE: This call should not return.  This function must be careful not
-         * to create anything that needs to be dropped to function correctly.
-         */
-        sys::door_return(std::ptr::null_mut(), 0, std::ptr::null_mut(), 0)
+        return None;
     };
-    if r != -1 {
-        /*
-         * XXX Should upanic() here; this function should not return without an
-         * error.
-         */
-        eprintln!("[{tid}] DOOR RETURN RETURNED ZERO");
-        std::process::abort();
-    }
 
-    let e = unsafe { *libc::___errno() };
-    eprintln!("[{tid}] DOOR RETURN FAILURE: e {e}");
-
-    rust_door_thread_exit();
+    /*
+     * Call the door service routine provided by the user.
+     */
+    Some((di.func).call(Arg { arg, descs, return_buffer }))
 }
 
 impl Door {
     fn new<F>(func: F) -> Result<Door>
     where
-        F: Fn(Arg) + Send + Sync + RefUnwindSafe + 'static,
+        F: Fn(Arg) -> Return + Send + Sync + RefUnwindSafe + 'static,
     {
         /*
          * Install our door thread creation procedure, stashing the original
@@ -578,17 +771,13 @@ impl Door {
             }),
         };
 
-        println!("REF 1: {}", Arc::strong_count(&d.inner));
-
         /*
          * We need to turn the inner object into a raw pointer that we can use
          * as a cookie value to pass to door_create(3C).  In the drop
          * implementation for Door, we'll abort the process if we cannot claw
          * the pointer back from the system before we drop our reference.
          */
-        let cookie = Arc::as_ptr(&d.inner) as *mut c_void;
-
-        println!("REF 2: {}", Arc::strong_count(&d.inner));
+        let cookie = Arc::as_ptr(&d.inner);
 
         /*
          * Create a door descriptor.
@@ -596,7 +785,7 @@ impl Door {
         let fd = unsafe {
             sys::door_create(
                 rust_doors_server_proc,
-                cookie,
+                cookie as *mut c_void,
                 /*
                  * We want to know when a door becomes unreferenced.  We don't
                  * want the client to send us any file descriptors.  We do not
@@ -611,7 +800,7 @@ impl Door {
         };
         if fd < 0 {
             let e = std::io::Error::last_os_error();
-            let di = unsafe { Arc::from_raw(cookie) };
+            let _ = unsafe { Arc::from_raw(cookie) };
             bail!("could not create a door: {e}");
         }
 
@@ -630,14 +819,11 @@ impl Door {
             bail!("could not create door client for this door");
         };
 
-        Ok(DoorClient {
-            fd,
-            server_pid: std::process::id().try_into().unwrap(),
-        })
+        fd.try_into()
     }
 
     fn attach_impl(&self, path: &Path, force: bool) -> Result<()> {
-        let mut locked = self.inner.locked.lock().unwrap();
+        let locked = self.inner.locked.lock().unwrap();
 
         let fd = match (&locked.state, &locked.fd) {
             (ServerState::Created, Some(fd)) => fd.as_raw_fd(),
@@ -646,8 +832,6 @@ impl Door {
 
         let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
 
-        println!("REF 3: {}", Arc::strong_count(&self.inner));
-
         if force {
             /*
              * First, remove an existing door if there is one.  A previous door
@@ -655,7 +839,7 @@ impl Door {
              * when we reattach.
              */
             unsafe { sys::fdetach(cpath.as_ptr()) };
-            match std::fs::remove_file(&path) {
+            match std::fs::remove_file(path) {
                 Ok(()) => (),
                 Err(e) if e.kind() == ErrorKind::NotFound => (),
                 Err(e) => bail!("removing {path:?}: {e}"),
@@ -670,7 +854,7 @@ impl Door {
         std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(&path)
+            .open(path)
             .map_err(|e| anyhow!("creating {path:?}: {e}"))?;
 
         let r = unsafe { sys::fattach(fd, cpath.as_ptr()) };
@@ -682,6 +866,7 @@ impl Door {
         Ok(())
     }
 
+    #[allow(unused)]
     fn attach<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         self.attach_impl(path.as_ref(), false)
     }
@@ -691,13 +876,10 @@ impl Door {
     }
 
     fn wait_for_unref(&self) {
-        //println!("REF WFU E: {}", Arc::strong_count(&self.inner));
-
         let mut locked = self.inner.locked.lock().unwrap();
         while !locked.unref {
             locked = self.inner.cv.wait(locked).unwrap();
         }
-        //println!("REF WFU R: {}", Arc::strong_count(&self.inner));
     }
 
     fn revoke(&self) -> Result<()> {
@@ -773,7 +955,6 @@ impl Door {
                 bail!("no fd for door server");
             };
 
-            println!("REVOKE: marking stopped...");
             locked.state = ServerState::Stopping;
             self.inner.cv.notify_all();
 
@@ -785,12 +966,10 @@ impl Door {
                 st.cv.notify_all();
             }
 
-            (fd, std::mem::replace(&mut locked.threads, Default::default()))
+            (fd, std::mem::take(&mut locked.threads))
         };
 
-        println!("REVOKE: starting helper...");
         let jh = std::thread::spawn(move || loop {
-            println!("HELPER: make a the door call...");
             let mut arg = sys::DoorArg {
                 data_ptr: std::ptr::null_mut(),
                 data_size: 0,
@@ -836,7 +1015,6 @@ impl Door {
                 break;
             }
 
-            println!("REVOKE: {nactive} still active");
             std::thread::yield_now();
         }
 
@@ -865,10 +1043,8 @@ impl Door {
             bail!("door_revoke failed -- r {r} e {e}");
         }
 
-        println!("REVOKE: joining helper...");
         jh.join().unwrap();
 
-        println!("REVOKE: ok!");
         let mut locked = self.inner.locked.lock().unwrap();
         assert!(locked.fd.is_none());
         locked.state = ServerState::Stopped;
@@ -887,85 +1063,10 @@ impl Drop for Door {
          * pointer that we have used as a cookie for door_create(3C).
          */
         if let Err(e) = self.revoke() {
-            /*
-             * XXX upanic() here
-             */
-            panic!("door server still active on drop, revocation failed: {e}");
+            upanic(format!(
+                "door server still active on drop, revocation failed: {e}"
+            ));
         }
-
-        println!(
-            "    DOOR DROP = refcount s {} w {}",
-            Arc::strong_count(&self.inner),
-            Arc::weak_count(&self.inner),
-        );
-    }
-}
-
-struct DoorClient {
-    fd: OwnedFd,
-    server_pid: libc::pid_t,
-}
-
-impl TryFrom<OwnedFd> for DoorClient {
-    type Error = anyhow::Error;
-
-    fn try_from(fd: OwnedFd) -> Result<Self> {
-        let mut info: sys::DoorInfo = unsafe { std::mem::zeroed() };
-        let r = unsafe { sys::door_info(fd.as_raw_fd(), &mut info) };
-        if r != 0 {
-            let e = std::io::Error::last_os_error();
-            bail!("could not get door info: {e}");
-        }
-        println!("client info = {:#?}", info);
-
-        Ok(DoorClient { fd, server_pid: info.di_target })
-    }
-}
-
-impl DoorClient {
-    fn new<P: AsRef<Path>>(path: P) -> Result<DoorClient> {
-        let path = path.as_ref();
-        let file = File::open(path)
-            .map_err(|e| anyhow!("opening door {path:?}: {e}"))?;
-
-        let fd: OwnedFd = file.into();
-
-        let mut info: sys::DoorInfo = unsafe { std::mem::zeroed() };
-        let r = unsafe { sys::door_info(fd.as_raw_fd(), &mut info) };
-        if r != 0 {
-            let e = std::io::Error::last_os_error();
-            bail!("could not get door info: {e}");
-        }
-
-        println!("info = {:#?}", info);
-        Ok(DoorClient { fd, server_pid: info.di_target })
-    }
-
-    fn call(&self) -> Result<()> {
-        let fd = self.fd.as_raw_fd();
-
-        let mut arg = sys::DoorArg {
-            data_ptr: std::ptr::null_mut(),
-            data_size: 0,
-            desc_ptr: std::ptr::null_mut(),
-            desc_num: 0,
-            rbuf: std::ptr::null_mut(),
-            rsize: 0,
-        };
-
-        let r = unsafe { sys::door_call(fd, &mut arg) };
-        if r != 0 {
-            let e = std::io::Error::last_os_error();
-
-            match e.kind() {
-                ErrorKind::Interrupted => bail!("door call interrupted"),
-                _ => bail!("door call failure: {e}"),
-            }
-        }
-
-        //println!("arg after call = {arg:#?}");
-
-        Ok(())
     }
 }
 
@@ -982,11 +1083,11 @@ fn main() -> Result<()> {
         let dc = Arc::new(DoorClient::new(door)?);
 
         let threads: Vec<JoinHandle<String>> = (0..16)
-            .map(|_| {
+            .map(|thr| {
                 let dc = Arc::clone(&dc);
                 std::thread::spawn(move || loop {
                     match dc.call() {
-                        Ok(_) => continue,
+                        Ok(r) => println!("{thr}: res = {:?}", r.as_bytes()),
                         Err(e) => return format!("ERROR: {e}"),
                     }
                 })
@@ -1002,13 +1103,22 @@ fn main() -> Result<()> {
 
     if opts.opt_present("c") {
         let dc = DoorClient::new(door)?;
-        dc.call()?;
+        let res = dc.call()?;
+        println!("res = {:?}", res.as_bytes());
         return Ok(());
     }
 
-    let d = Door::new(|a| {
-        println!("door call! arg {a:?}");
-        //panic!("oh no!");
+    let d = Door::new(|mut a| {
+        println!("door call! {:?}", a.as_bytes());
+
+        //a.make_return().string("abcdef")
+
+        a.make_return().raw(|buf| {
+            buf[25] = b'A';
+            26
+        })
+
+        //a.make_return().return_u64(0x0000000504030201)
     })?;
 
     let report = || {
@@ -1033,11 +1143,13 @@ fn main() -> Result<()> {
         println!("---- own server:");
 
         let dc = d.self_client()?;
-        dc.call()?;
-        dc.call()?;
-        dc.call()?;
-        dc.call()?;
+        for _ in 0..5 {
+            let res = dc.call()?;
+
+            println!("    result: {:?}", res.as_bytes());
+        }
         drop(dc);
+
         println!("---- own server^");
     }
 
@@ -1048,17 +1160,4 @@ fn main() -> Result<()> {
     d.revoke()?;
 
     Ok(())
-
-    // println!("dropping...");
-    // println!(
-    //     "    = refcount s {} w {}",
-    //     Arc::strong_count(&d.inner),
-    //     Arc::weak_count(&d.inner),
-    // );
-    // drop(d);
-
-    // println!("waiting...");
-    // loop {
-    //     std::thread::sleep(Duration::from_secs(1));
-    // }
 }

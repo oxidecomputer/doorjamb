@@ -1,10 +1,7 @@
 use libc::{c_char, c_int, c_long, c_uint, c_ulonglong, c_void, pid_t, size_t};
 
-#[allow(non_camel_case_types)]
-pub enum door_desc_t {}
-
 pub type ServerProcedureFn =
-    extern "C" fn(*mut c_void, *mut c_char, size_t, *mut door_desc_t, c_uint);
+    extern "C" fn(*mut c_void, *mut c_char, size_t, *mut DoorDesc, c_uint);
 
 pub type CreateProcFn = extern "C" fn(*mut DoorInfo);
 
@@ -23,6 +20,15 @@ pub struct DoorInfo {
 pub struct DoorDesc {
     pub d_attributes: c_uint,
     pub d_data: DoorDescData,
+}
+
+impl std::fmt::Debug for DoorDesc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        /*
+         * XXX
+         */
+        write!(f, "<DoorDesc>")
+    }
 }
 
 #[repr(C)]
@@ -76,13 +82,15 @@ extern "C" {
     pub fn door_return(
         data_ptr: *mut c_char,
         data_size: size_t,
-        desc_ptr: *mut door_desc_t,
+        desc_ptr: *mut DoorDesc,
         num_desc: c_uint,
     ) -> c_int;
 
     pub fn door_call(d: c_int, params: *mut DoorArg) -> c_int;
 
-    pub fn door_server_create(create_proc: CreateProcFn) -> CreateProcFn;
+    pub fn door_server_create(
+        create_proc: CreateProcFn,
+    ) -> Option<CreateProcFn>;
 
     pub fn door_info(d: c_int, info: *mut DoorInfo) -> c_int;
 
@@ -100,6 +108,8 @@ extern "C" {
     pub fn thr_setname(tid: c_uint, name: *const c_char) -> c_int;
 
     pub fn thr_self() -> c_uint;
+
+    pub fn upanic(msg: *const c_char, len: size_t) -> !;
 }
 
 pub const PTHREAD_CANCEL_DISABLE: c_int = 0x01;
