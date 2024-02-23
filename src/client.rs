@@ -1,24 +1,14 @@
 use std::{
-    cell::RefCell,
-    ffi::CString,
     fs::File,
     io::ErrorKind,
     mem::MaybeUninit,
-    os::{
-        fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
-        unix::prelude::OsStrExt,
-    },
-    panic::RefUnwindSafe,
+    os::fd::{AsRawFd, OwnedFd},
     path::Path,
-    pin::Pin,
-    sync::{Arc, Condvar, Mutex, Weak},
-    thread::JoinHandle,
-    time::Duration,
 };
 
 use crate::sys;
 use anyhow::{anyhow, bail, Result};
-use libc::{c_char, c_uint, c_void, size_t};
+use libc::{c_char, c_void};
 
 pub struct DoorClient {
     fd: OwnedFd,
