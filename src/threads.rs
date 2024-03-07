@@ -82,12 +82,13 @@ extern "C" fn rust_door_create_proc(infop: *mut sys::DoorInfo) {
     }
 
     /*
-     * Check some invariants:
+     * Check some invariants.  Note that we cannot check for DOOR_UNREF here, as
+     * the doors subsystem actually removes that flag from our attributes once
+     * it has delivered our unref event.  This is frankly unseemly behaviour for
+     * a library, but for now we need to live with it.
      */
-    let expected_attrs = sys::DOOR_UNREF
-        | sys::DOOR_REFUSE_DESC
-        | sys::DOOR_NO_CANCEL
-        | sys::DOOR_PRIVATE;
+    let expected_attrs =
+        sys::DOOR_REFUSE_DESC | sys::DOOR_NO_CANCEL | sys::DOOR_PRIVATE;
     if (info.di_attributes & expected_attrs) != expected_attrs {
         upanic(format!(
             "some expected attributes missing: 0x{:x} != 0x{:x}",
