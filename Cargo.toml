@@ -1,7 +1,8 @@
 [package]
-name = "doors"
+name = "doorjamb"
 version = "0.0.0"
 edition = "2021"
+license = "MPL-2.0"
 
 [dependencies]
 libc = "0.2"

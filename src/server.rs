@@ -1,3 +1,7 @@
+/*
+ * Copyright 2024 Oxide Computer Company
+ */
+
 use std::{
     cell::UnsafeCell,
     ffi::CString,

@@ -1,3 +1,7 @@
+/*
+ * Copyright 2024 Oxide Computer Company
+ */
+
 use crate::server::RBUF_MAX;
 use crate::sys;
 

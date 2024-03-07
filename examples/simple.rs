@@ -1,17 +1,11 @@
+/*
+ * Copyright 2024 Oxide Computer Company
+ */
+
 use std::{sync::Arc, thread::JoinHandle};
 
 use anyhow::Result;
-pub use args::*;
-use client::DoorClient;
-use server::DoorServer;
-
-mod args;
-pub mod client;
-pub mod server;
-#[allow(unused)]
-mod sys;
-mod threads;
-mod upanic;
+use doorjamb::prelude::*;
 
 fn main() -> Result<()> {
     let door = "/tmp/THEDOOR";
