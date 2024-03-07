@@ -69,20 +69,20 @@ pub fn install_create_proc() {
 }
 
 #[no_mangle]
-extern "C" fn rust_door_create_proc(infop: *mut sys::DoorInfo) {
+unsafe extern "C" fn rust_door_create_proc(infop: *mut sys::DoorInfo) {
     /*
      * Make sure this door is one created with DOOR_PRIVATE; i.e., that we were
      * passed a door_info_t:
      */
     let Some(info) = (unsafe { infop.as_ref() }) else {
-        return rust_door_create_proc_fallback(infop);
+        return unsafe { rust_door_create_proc_fallback(infop) };
     };
 
     /*
      * Confirm that the door server procedure is our wrapper:
      */
     if info.di_proc != (rust_doors_server_proc as *mut c_void) {
-        return rust_door_create_proc_fallback(infop);
+        return unsafe { rust_door_create_proc_fallback(infop) };
     }
 
     /*
@@ -214,18 +214,18 @@ extern "C" fn rust_door_create_proc(infop: *mut sys::DoorInfo) {
 }
 
 #[no_mangle]
-extern "C" fn rust_door_create_proc_fallback(infop: *mut sys::DoorInfo) {
+unsafe extern "C" fn rust_door_create_proc_fallback(infop: *mut sys::DoorInfo) {
     /*
      * Delegate to the original server thread creation routine if one
      * existed when we registered ours
      */
     if let Some(Some(create_proc)) = ORIGINAL_CREATE_PROC.get() {
-        create_proc(infop);
+        unsafe { create_proc(infop) };
     }
 }
 
 #[no_mangle]
-extern "C" fn rust_door_thread(arg: *mut c_void) -> *mut c_void {
+unsafe extern "C" fn rust_door_thread(arg: *mut c_void) -> *mut c_void {
     let res = std::panic::catch_unwind(|| {
         /*
          * When this thread was created, rust_door_create_proc() passed us a raw
@@ -239,7 +239,7 @@ extern "C" fn rust_door_thread(arg: *mut c_void) -> *mut c_void {
          * occur naturally for things like mutex guards before we end up back
          * here.
          */
-        if !rust_door_thread_impl(arg as *const ServerThread) {
+        if !unsafe { rust_door_thread_impl(arg as *const ServerThread) } {
             /*
              * We didn't get all the way off the ground.  Return through the
              * cleanup path.
@@ -268,7 +268,7 @@ extern "C" fn rust_door_thread(arg: *mut c_void) -> *mut c_void {
 }
 
 #[no_mangle]
-fn rust_door_thread_impl(st: *const ServerThread) -> bool {
+unsafe fn rust_door_thread_impl(st: *const ServerThread) -> bool {
     /*
      * Stash the door info pointer in our thread local so that we can find it
      * later.  We consider the reference parked here, and thus safe to use from

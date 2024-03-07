@@ -88,7 +88,7 @@ impl Drop for DoorInner {
 pub(crate) const RBUF_MAX: usize = 64 * 1024;
 
 #[no_mangle]
-pub(crate) extern "C" fn rust_doors_server_proc(
+pub(crate) unsafe extern "C" fn rust_doors_server_proc(
     cookie: *mut c_void,
     argp: *mut c_char,
     arg_size: size_t,
@@ -157,7 +157,9 @@ pub(crate) extern "C" fn rust_doors_server_proc(
             ))
         };
 
-        if let Some(ret) = rust_doors_server_proc_impl(di, args, rbuf) {
+        if let Some(ret) =
+            unsafe { rust_doors_server_proc_impl(di, args, rbuf) }
+        {
             Some(ret.len)
         } else {
             threads::rust_door_thread_exit();
@@ -212,7 +214,7 @@ pub(crate) extern "C" fn rust_doors_server_proc(
 }
 
 #[no_mangle]
-fn rust_doors_server_proc_impl(
+unsafe fn rust_doors_server_proc_impl(
     di: *const DoorInner,
     arg: Option<(&[u8], &[sys::DoorDesc])>,
     return_buffer: *mut [u8; RBUF_MAX],

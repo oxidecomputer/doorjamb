@@ -1,9 +1,18 @@
+/*
+ * Copyright 2024 Oxide Computer Company
+ */
+
 use libc::{c_char, c_int, c_long, c_uint, c_ulonglong, c_void, pid_t, size_t};
 
-pub type ServerProcedureFn =
-    extern "C" fn(*mut c_void, *mut c_char, size_t, *mut DoorDesc, c_uint);
+pub type ServerProcedureFn = unsafe extern "C" fn(
+    *mut c_void,
+    *mut c_char,
+    size_t,
+    *mut DoorDesc,
+    c_uint,
+);
 
-pub type CreateProcFn = extern "C" fn(*mut DoorInfo);
+pub type CreateProcFn = unsafe extern "C" fn(*mut DoorInfo);
 
 #[derive(Debug)]
 #[repr(C, packed(4))]
@@ -99,7 +108,7 @@ extern "C" {
     pub fn thr_create(
         stack_base: *mut c_void,
         stack_size: size_t,
-        start_func: extern "C" fn(*mut c_void) -> *mut c_void,
+        start_func: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
         arg: *mut c_void,
         flags: c_long,
         new_thread_id: *mut c_uint,
