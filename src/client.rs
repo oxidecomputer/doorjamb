@@ -47,8 +47,17 @@ impl DoorClient {
     }
 
     pub fn call(&self) -> Result<DoorResult> {
+        self.call_with_buf(&[])
+    }
+
+    pub fn call_with_buf(&self, data: &[u8]) -> Result<DoorResult> {
         let fd = self.fd.as_raw_fd();
         let mut dr = DoorResult::new();
+
+        if !data.is_empty() {
+            dr.arg.data_ptr = data.as_ptr() as *mut i8;
+            dr.arg.data_size = data.len();
+        }
 
         let r = unsafe { sys::door_call(fd, &mut dr.arg) };
         if r != 0 {
