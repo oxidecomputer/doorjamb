@@ -10,7 +10,6 @@ use std::{
         fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
         unix::prelude::OsStrExt,
     },
-    panic::RefUnwindSafe,
     path::Path,
     sync::{Arc, Condvar, Mutex},
 };
@@ -51,13 +50,13 @@ pub(crate) struct DoorFuncBox<F> {
     func: F,
 }
 
-pub(crate) trait DoorFuncBoxCall: Sync + Send + RefUnwindSafe {
+pub(crate) trait DoorFuncBoxCall: Sync + Send {
     fn call(&self, a: DoorArg) -> DoorReturn;
 }
 
 impl<F> DoorFuncBoxCall for DoorFuncBox<F>
 where
-    F: Sync + Send + Fn(DoorArg) -> DoorReturn + RefUnwindSafe,
+    F: Sync + Send + Fn(DoorArg) -> DoorReturn ,
 {
     fn call(&self, a: DoorArg) -> DoorReturn {
         (self.func)(a)
@@ -272,7 +271,7 @@ unsafe fn rust_doors_server_proc_impl(
 impl DoorServer {
     pub fn new<F>(func: F) -> Result<DoorServer>
     where
-        F: Fn(DoorArg) -> DoorReturn + Send + Sync + RefUnwindSafe + 'static,
+        F: Fn(DoorArg) -> DoorReturn + Send + Sync + 'static,
     {
         threads::install_create_proc();
 
