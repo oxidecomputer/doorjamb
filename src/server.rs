@@ -56,7 +56,7 @@ pub(crate) trait DoorFuncBoxCall: Sync + Send {
 
 impl<F> DoorFuncBoxCall for DoorFuncBox<F>
 where
-    F: Sync + Send + Fn(DoorArg) -> DoorReturn ,
+    F: Sync + Send + Fn(DoorArg) -> DoorReturn,
 {
     fn call(&self, a: DoorArg) -> DoorReturn {
         (self.func)(a)
